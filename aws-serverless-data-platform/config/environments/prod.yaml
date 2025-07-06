@@ -1,0 +1,203 @@
+# =============================================================================
+# Production Environment Configuration
+# High availability, security, and compliance settings for production workloads
+# =============================================================================
+
+# Networking configuration for production
+networking:
+  vpc:
+    cidr: "10.2.0.0/16"
+    enable_flow_logs: true
+  
+  # Large subnets for production scale
+  subnets:
+    private:
+      - "10.2.1.0/24"
+      - "10.2.2.0/24"
+      - "10.2.3.0/24"
+    public:
+      - "10.2.101.0/24"
+      - "10.2.102.0/24"
+      - "10.2.103.0/24"
+    database:
+      - "10.2.201.0/24"
+      - "10.2.202.0/24"
+      - "10.2.203.0/24"
+  
+  # Multi-AZ NAT Gateways for high availability
+  nat_gateway:
+    single_nat_gateway: false
+  
+  # Enhanced security
+  security_groups:
+    enable_strict_egress: true
+    enable_logging: true
+
+# Storage configuration for production
+storage:
+  s3:
+    force_destroy: false
+    mfa_delete: true  # Extra protection for prod
+    encryption: "aws:kms"
+  
+  # Long-term retention for production
+  lifecycle:
+    transition_ia_days: 30
+    transition_glacier_days: 90
+    transition_deep_archive_days: 365
+    expiration_days: 2555  # 7 years for compliance
+
+# Streaming configuration for production
+streaming:
+  kinesis:
+    shard_count: 10
+    retention_period: 168  # 7 days
+  
+  msk:
+    kafka_version: "2.8.1"
+    number_of_broker_nodes: 6  # Multi-AZ, 2 per AZ
+    instance_type: "kafka.m5.xlarge"
+    enhanced_monitoring: "PER_TOPIC_PER_BROKER"
+    
+    # Security enhancements
+    encryption:
+      encryption_in_transit: "TLS"
+      encryption_at_rest: true
+
+# Orchestration configuration for production
+orchestration:
+  mwaa:
+    airflow_version: "2.5.1"
+    environment_class: "mw1.large"
+    max_workers: 25
+    min_workers: 2
+    schedulers: 2
+    
+    # High availability
+    network_configuration:
+      security_group_ids: []
+      subnet_ids: []
+  
+  step_functions:
+    enable_logging: true
+    log_level: "ALL"
+    enable_x_ray_tracing: true
+
+# Analytics configuration for production
+analytics:
+  athena:
+    query_result_retention_days: 90
+    enable_workgroup_result_encryption: true
+  
+  # Production Redshift cluster
+  redshift:
+    node_type: "ra3.xlplus"
+    number_of_nodes: 3
+    enable_enhanced_vpc_routing: true
+    enable_logging: true
+    
+    # Backup and maintenance
+    automated_snapshot_retention_period: 35
+    preferred_maintenance_window: "sun:03:00-sun:04:00"
+  
+  quicksight:
+    enable: true
+    edition: "ENTERPRISE"
+
+# Monitoring configuration for production
+monitoring:
+  cloudwatch:
+    retention_days: 90
+    enable_detailed_monitoring: true
+  
+  cloudtrail:
+    retention_days: 365
+    enable_insight_events: true
+  
+  # Enhanced monitoring
+  performance_insights:
+    enable: true
+    retention_period: 31
+  
+  # Alerting configuration
+  alerts:
+    enable_cost_alerts: true
+    enable_performance_alerts: true
+    enable_security_alerts: true
+    
+    # SNS topic for critical alerts
+    critical_alert_topic: "data-platform-critical-alerts"
+
+# Security configuration for production
+security:
+  kms:
+    deletion_window: 30
+    enable_key_rotation: true
+  
+  # WAF configuration
+  waf:
+    enable: true
+    rate_limit: 5000
+    enable_geo_blocking: true
+    blocked_countries: ["CN", "RU", "KP"]
+  
+  # GuardDuty integration
+  guardduty:
+    enable: true
+    enable_malware_protection: true
+  
+  # Security Hub integration
+  security_hub:
+    enable: true
+    enable_aws_foundational_standard: true
+    enable_cis_standard: true
+
+# Disaster recovery configuration
+disaster_recovery:
+  enable: true
+  backup_region: "us-west-2"
+  rpo_hours: 4  # Recovery Point Objective
+  rto_hours: 2  # Recovery Time Objective
+  
+  # Cross-region replication
+  s3_replication:
+    enable: true
+    replica_kms_key_id: ""
+  
+  # Database backups
+  automated_backups:
+    enable: true
+    retention_period: 35
+
+# Compliance configuration
+compliance:
+  enable_compliance_monitoring: true
+  enable_data_classification: true
+  enable_access_logging: true
+  
+  # Regulatory requirements
+  gdpr_compliance: true
+  hipaa_compliance: false  # Set to true if handling healthcare data
+  sox_compliance: true
+
+# Auto-scaling configuration for production
+auto_scaling:
+  enable: true
+  target_utilization: 60  # More conservative for prod
+  scale_up_cooldown: 300
+  scale_down_cooldown: 600  # Slower scale-down in prod
+  
+  # Predictive scaling
+  predictive_scaling:
+    enable: true
+    mode: "ForecastAndScale"
+
+# Environment-specific tags
+tags:
+  Environment: "production"
+  CriticalityLevel: "high"
+  DataClassification: "confidential"
+  Monitoring: "comprehensive"
+  BackupRequired: "critical"
+  ComplianceRequired: "true"
+  SLA: "99.9%" 

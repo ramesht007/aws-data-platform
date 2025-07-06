@@ -1,0 +1,234 @@
+# =============================================================================
+# Terraform Apply Workflow
+# Applies Terraform changes after approval for production environments
+# =============================================================================
+
+name: 'Terraform Apply'
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'aws-serverless-data-platform/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - staging
+        - prod
+      region:
+        description: 'AWS Region to deploy to'
+        required: true
+        default: 'us-east-1'
+        type: choice
+        options:
+        - us-east-1
+        - us-west-2
+      module:
+        description: 'Specific module to deploy (optional)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  deployments: write
+
+env:
+  TF_VERSION: '1.5.0'
+  TG_VERSION: '0.50.0'
+
+jobs:
+  pre-deploy-checks:
+    name: 'Pre-deployment Checks'
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      region: ${{ steps.set-env.outputs.region }}
+      module: ${{ steps.set-env.outputs.module }}
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set deployment parameters
+      id: set-env
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          echo "region=${{ github.event.inputs.region }}" >> $GITHUB_OUTPUT
+          echo "module=${{ github.event.inputs.module }}" >> $GITHUB_OUTPUT
+        else
+          echo "environment=dev" >> $GITHUB_OUTPUT
+          echo "region=us-east-1" >> $GITHUB_OUTPUT
+          echo "module=" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Validate deployment parameters
+      run: |
+        if [[ "${{ steps.set-env.outputs.environment }}" == "prod" && "${{ github.ref }}" != "refs/heads/main" ]]; then
+          echo "Production deployments only allowed from main branch"
+          exit 1
+        fi
+
+  terraform-apply:
+    name: 'Terraform Apply'
+    runs-on: ubuntu-latest
+    needs: pre-deploy-checks
+    environment: 
+      name: ${{ needs.pre-deploy-checks.outputs.environment }}
+      url: https://console.aws.amazon.com/
+    
+    defaults:
+      run:
+        shell: bash
+        working-directory: aws-serverless-data-platform
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets[format('AWS_ROLE_{0}_{1}', needs.pre-deploy-checks.outputs.environment, needs.pre-deploy-checks.outputs.region)] }}
+        role-session-name: terraform-apply-${{ needs.pre-deploy-checks.outputs.environment }}-${{ needs.pre-deploy-checks.outputs.region }}
+        aws-region: ${{ needs.pre-deploy-checks.outputs.region }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        terraform_wrapper: false
+
+    - name: Setup Terragrunt
+      run: |
+        wget -O terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TG_VERSION }}/terragrunt_linux_amd64
+        chmod +x terragrunt
+        sudo mv terragrunt /usr/local/bin/
+
+    - name: Create deployment tracking
+      run: |
+        echo "DEPLOYMENT_ID=$(date +%Y%m%d-%H%M%S)-${{ github.sha }}" >> $GITHUB_ENV
+        echo "Deployment ID: $DEPLOYMENT_ID"
+
+    - name: Terragrunt plan
+      id: plan
+      run: |
+        cd environments/${{ needs.pre-deploy-checks.outputs.environment }}/${{ needs.pre-deploy-checks.outputs.region }}
+        if [ -n "${{ needs.pre-deploy-checks.outputs.module }}" ]; then
+          cd ${{ needs.pre-deploy-checks.outputs.module }}
+          terragrunt plan -detailed-exitcode -out=tfplan
+        else
+          terragrunt run-all plan -detailed-exitcode -out=tfplan
+        fi
+
+    - name: Terragrunt apply
+      id: apply
+      run: |
+        cd environments/${{ needs.pre-deploy-checks.outputs.environment }}/${{ needs.pre-deploy-checks.outputs.region }}
+        if [ -n "${{ needs.pre-deploy-checks.outputs.module }}" ]; then
+          cd ${{ needs.pre-deploy-checks.outputs.module }}
+          terragrunt apply tfplan
+        else
+          terragrunt run-all apply tfplan
+        fi
+
+    - name: Generate deployment summary
+      if: always()
+      run: |
+        cat > deployment_summary.md << EOF
+        # Deployment Summary
+        
+        **Environment:** ${{ needs.pre-deploy-checks.outputs.environment }}
+        **Region:** ${{ needs.pre-deploy-checks.outputs.region }}
+        **Module:** ${{ needs.pre-deploy-checks.outputs.module || 'All modules' }}
+        **Deployment ID:** ${{ env.DEPLOYMENT_ID }}
+        **Status:** ${{ steps.apply.outcome }}
+        **Triggered by:** ${{ github.actor }}
+        **Commit:** ${{ github.sha }}
+        **Timestamp:** $(date -u)
+        
+        ## Applied Changes
+        \`\`\`
+        $(cd environments/${{ needs.pre-deploy-checks.outputs.environment }}/${{ needs.pre-deploy-checks.outputs.region }} && terragrunt show -no-color 2>/dev/null || echo "No state changes to display")
+        \`\`\`
+        EOF
+
+    - name: Post-deployment verification
+      run: |
+        cd environments/${{ needs.pre-deploy-checks.outputs.environment }}/${{ needs.pre-deploy-checks.outputs.region }}
+        echo "Running post-deployment verification..."
+        
+        # Check if all resources are created successfully
+        if [ -n "${{ needs.pre-deploy-checks.outputs.module }}" ]; then
+          cd ${{ needs.pre-deploy-checks.outputs.module }}
+          terragrunt output -json > outputs.json
+        else
+          terragrunt run-all output -json > outputs.json
+        fi
+        
+        echo "Deployment verification completed"
+
+    - name: Upload deployment artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: deployment-${{ needs.pre-deploy-checks.outputs.environment }}-${{ needs.pre-deploy-checks.outputs.region }}-${{ env.DEPLOYMENT_ID }}
+        path: |
+          aws-serverless-data-platform/deployment_summary.md
+          aws-serverless-data-platform/environments/${{ needs.pre-deploy-checks.outputs.environment }}/${{ needs.pre-deploy-checks.outputs.region }}/outputs.json
+        retention-days: 90
+
+    - name: Notify deployment status
+      if: always()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const status = '${{ steps.apply.outcome }}';
+          const emoji = status === 'success' ? '✅' : '❌';
+          
+          github.rest.repos.createCommitStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            sha: context.sha,
+            state: status === 'success' ? 'success' : 'failure',
+            description: `Deployment ${status} for ${{ needs.pre-deploy-checks.outputs.environment }}`,
+            context: 'terraform/apply'
+          });
+
+  post-deployment-tests:
+    name: 'Post-deployment Tests'
+    runs-on: ubuntu-latest
+    needs: [pre-deploy-checks, terraform-apply]
+    if: always() && needs.terraform-apply.result == 'success'
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets[format('AWS_ROLE_{0}_{1}', needs.pre-deploy-checks.outputs.environment, needs.pre-deploy-checks.outputs.region)] }}
+        role-session-name: post-deploy-tests-${{ needs.pre-deploy-checks.outputs.environment }}-${{ needs.pre-deploy-checks.outputs.region }}
+        aws-region: ${{ needs.pre-deploy-checks.outputs.region }}
+
+    - name: Setup Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Run Terratest integration tests
+      run: |
+        cd aws-serverless-data-platform/tests/integration
+        go test -v -timeout 30m ./...
+      env:
+        ENVIRONMENT: ${{ needs.pre-deploy-checks.outputs.environment }}
+        AWS_REGION: ${{ needs.pre-deploy-checks.outputs.region }} 

@@ -1,0 +1,127 @@
+# =============================================================================
+# Staging Environment Configuration
+# Production-like settings with moderate scale for testing
+# =============================================================================
+
+# Networking configuration for staging
+networking:
+  vpc:
+    cidr: "10.1.0.0/16"
+  
+  # Medium-sized subnets for staging
+  subnets:
+    private:
+      - "10.1.1.0/24"
+      - "10.1.2.0/24"
+      - "10.1.3.0/24"
+    public:
+      - "10.1.101.0/24"
+      - "10.1.102.0/24"
+      - "10.1.103.0/24"
+    database:
+      - "10.1.201.0/24"
+      - "10.1.202.0/24"
+      - "10.1.203.0/24"
+  
+  # Multi-AZ NAT Gateways for HA testing
+  nat_gateway:
+    single_nat_gateway: false
+
+# Storage configuration for staging
+storage:
+  s3:
+    force_destroy: false  # Protect data in staging
+  
+  # Moderate lifecycle for staging
+  lifecycle:
+    transition_ia_days: 15
+    transition_glacier_days: 60
+    expiration_days: 1095  # 3 years
+
+# Streaming configuration for staging
+streaming:
+  kinesis:
+    shard_count: 2
+    retention_period: 168  # 7 days
+  
+  msk:
+    kafka_version: "2.8.1"
+    number_of_broker_nodes: 3
+    instance_type: "kafka.m5.large"
+
+# Orchestration configuration for staging
+orchestration:
+  mwaa:
+    airflow_version: "2.5.1"
+    environment_class: "mw1.medium"
+    max_workers: 5
+    min_workers: 1
+    schedulers: 2
+  
+  step_functions:
+    enable_logging: true
+    log_level: "ERROR"
+
+# Analytics configuration for staging
+analytics:
+  athena:
+    query_result_retention_days: 15
+  
+  # Medium Redshift for staging workloads
+  redshift:
+    node_type: "dc2.large"
+    number_of_nodes: 2
+  
+  quicksight:
+    enable: true
+
+# Monitoring configuration for staging
+monitoring:
+  cloudwatch:
+    retention_days: 14
+    enable_detailed_monitoring: true
+  
+  cloudtrail:
+    retention_days: 60
+  
+  # Performance insights for staging
+  performance_insights:
+    enable: true
+    retention_period: 7
+
+# Security configuration for staging
+security:
+  kms:
+    deletion_window: 15
+  
+  # Additional security for staging
+  waf:
+    enable: true
+    rate_limit: 10000
+
+# Staging-specific features
+staging:
+  enable_performance_testing: true
+  enable_load_testing: true
+  enable_disaster_recovery_testing: true
+  
+  # Data refresh from prod (masked)
+  data_refresh:
+    enable: true
+    schedule: "cron(0 2 * * 0)"  # Weekly on Sunday
+    mask_pii: true
+
+# Auto-scaling configuration
+auto_scaling:
+  enable: true
+  target_utilization: 70
+  scale_up_cooldown: 300
+  scale_down_cooldown: 300
+
+# Environment-specific tags
+tags:
+  Environment: "staging"
+  Purpose: "integration-testing"
+  DataClassification: "internal"
+  Monitoring: "enhanced"
+  BackupRequired: "true" 

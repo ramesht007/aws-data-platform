@@ -1,0 +1,51 @@
+# =============================================================================
+# Account Configuration
+# Per-environment AWS account details and state management
+# =============================================================================
+
+dev:
+  aws:
+    account_id: "356240508702"
+    assume_role_arn: "arn:aws:iam::356240508702:role/TerraformAccessRole"
+    region: "ap-southeast-1"
+  
+  terraform:
+    state_bucket: "aws-data-platform-terraform-state-dev"
+  
+  # Development-specific overrides
+  tags:
+    Environment: "development"
+    CostCenter: "DataEngineering-Dev"
+    AutoShutdown: "true"
+
+# staging:
+#   aws:
+#     account_id: "234567890123"
+#     assume_role_arn: "arn:aws:iam::234567890123:role/TerraformExecutionRole"
+#     region: "ap-southeast-1"
+  
+#   terraform:
+#     state_bucket: "aws-data-platform-terraform-state-staging"
+  
+#   # Staging-specific overrides
+#   tags:
+#     Environment: "staging"
+#     CostCenter: "DataEngineering-Staging"
+#     AutoShutdown: "false"
+
+# prod:
+#   aws:
+#     account_id: "345678901234"
+#     assume_role_arn: "arn:aws:iam::345678901234:role/TerraformExecutionRole"
+#     region: "ap-southeast-1"
+  
+#   terraform:
+#     state_bucket: "aws-data-platform-terraform-state-prod"
+  
+#   # Production-specific overrides
+#   tags:
+#     Environment: "production"
+#     CostCenter: "DataEngineering-Prod"
+#     AutoShutdown: "false"
+#     ComplianceRequired: "true"
+#     BackupTier: "Critical" 

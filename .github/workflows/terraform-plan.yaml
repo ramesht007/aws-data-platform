@@ -1,0 +1,177 @@
+# =============================================================================
+# Terraform Plan Workflow
+# Runs Terraform plan on pull requests and pushes to show infrastructure changes
+# =============================================================================
+
+name: 'Terraform Plan'
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'aws-serverless-data-platform/**'
+      - '.github/workflows/terraform-plan.yaml'
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'aws-serverless-data-platform/**'
+      - '.github/workflows/terraform-plan.yaml'
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+env:
+  TF_VERSION: '1.5.0'
+  TG_VERSION: '0.50.0'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  terraform-plan:
+    name: 'Terraform Plan'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging]
+        region: [us-east-1, us-west-2]
+      fail-fast: false
+    
+    defaults:
+      run:
+        shell: bash
+        working-directory: aws-serverless-data-platform
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets[format('AWS_ROLE_{0}_{1}', matrix.environment, matrix.region)] }}
+        role-session-name: terraform-plan-${{ matrix.environment }}-${{ matrix.region }}
+        aws-region: ${{ matrix.region }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        terraform_wrapper: false
+
+    - name: Setup Terragrunt
+      run: |
+        wget -O terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TG_VERSION }}/terragrunt_linux_amd64
+        chmod +x terragrunt
+        sudo mv terragrunt /usr/local/bin/
+
+    - name: Validate Terraform formatting
+      run: terraform fmt -check -recursive .
+
+    - name: Terragrunt validate
+      run: |
+        cd environments/${{ matrix.environment }}/${{ matrix.region }}
+        terragrunt run-all validate
+
+    - name: Terragrunt plan
+      id: plan
+      run: |
+        cd environments/${{ matrix.environment }}/${{ matrix.region }}
+        terragrunt run-all plan -detailed-exitcode -out=tfplan 2>&1 | tee plan_output.txt
+        echo "exitcode=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+      continue-on-error: true
+
+    - name: Generate plan summary
+      run: |
+        cd environments/${{ matrix.environment }}/${{ matrix.region }}
+        python3 ../../summarize_plan.py plan_output.txt > plan_summary.md
+
+    - name: Comment plan on PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const path = 'aws-serverless-data-platform/environments/${{ matrix.environment }}/${{ matrix.region }}/plan_summary.md';
+          
+          if (fs.existsSync(path)) {
+            const planSummary = fs.readFileSync(path, 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan Results\n**Environment:** ${{ matrix.environment }}\n**Region:** ${{ matrix.region }}\n\n${planSummary}`
+            });
+          }
+
+    - name: Security scan with tfsec
+      uses: aquasecurity/tfsec-action@v1.0.3
+      with:
+        working_directory: aws-serverless-data-platform
+        soft_fail: true
+
+    - name: Security scan with Checkov
+      uses: bridgecrewio/checkov-action@master
+      with:
+        directory: aws-serverless-data-platform
+        framework: terraform
+        soft_fail: true
+        output_format: sarif
+        output_file_path: checkov.sarif
+
+    - name: Upload Checkov results to GitHub Security tab
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: checkov.sarif
+
+    - name: Upload plan artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-plan-${{ matrix.environment }}-${{ matrix.region }}
+        path: |
+          aws-serverless-data-platform/environments/${{ matrix.environment }}/${{ matrix.region }}/plan_output.txt
+          aws-serverless-data-platform/environments/${{ matrix.environment }}/${{ matrix.region }}/plan_summary.md
+          aws-serverless-data-platform/environments/${{ matrix.environment }}/${{ matrix.region }}/tfplan
+        retention-days: 30
+
+    - name: Plan status check
+      if: steps.plan.outputs.exitcode == 1
+      run: |
+        echo "Terraform plan failed"
+        exit 1
+
+  cost-estimation:
+    name: 'Cost Estimation'
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Download plan artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: terraform-plan-*
+        merge-multiple: true
+
+    - name: Setup Infracost
+      uses: infracost/actions/setup@v2
+      with:
+        api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+    - name: Generate cost estimate
+      run: |
+        infracost breakdown --path=aws-serverless-data-platform \
+          --format=json \
+          --out-file=infracost.json
+
+    - name: Comment cost estimate on PR
+      uses: infracost/actions/comment@v2
+      with:
+        path: infracost.json
+        behavior: update 

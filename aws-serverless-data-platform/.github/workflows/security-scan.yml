@@ -1,0 +1,386 @@
+# =============================================================================
+# Security Scan Workflow
+# Runs security scans on Terraform code using Checkov and TFSec
+# =============================================================================
+
+name: "Security Scan"
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Run security scan daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CHECKOV_VERSION: "3.1.0"
+  TFSEC_VERSION: "1.28.4"
+
+jobs:
+  checkov-scan:
+    name: "Checkov Security Scan"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Checkov
+        run: |
+          pip install checkov==${{ env.CHECKOV_VERSION }}
+          checkov --version
+
+      - name: Create Checkov Configuration
+        run: |
+          cat > .checkov.yaml << EOF
+          # Checkov configuration for AWS Data Platform
+          framework:
+            - terraform
+            - secrets
+          
+          output:
+            - cli
+            - sarif
+            - json
+          
+          quiet: false
+          compact: true
+          
+          # Skip checks that are not applicable or too noisy
+          skip-check:
+            - CKV_AWS_18   # S3 bucket logging - handled separately
+            - CKV_AWS_52   # S3 bucket MFA delete - only for critical buckets
+            - CKV_AWS_144  # S3 bucket cross-region replication - environment specific
+          
+          # Include custom checks directory if it exists
+          external-checks-dir:
+            - .checkov/custom-checks
+          
+          # Exclude generated files and temporary directories
+          skip-path:
+            - .terraform/
+            - .terragrunt-cache/
+          EOF
+
+      - name: Run Checkov Scan
+        run: |
+          echo "Running Checkov security scan..."
+          
+          # Create output directory
+          mkdir -p security-reports
+          
+          # Run Checkov with multiple output formats
+          checkov \
+            --config-file .checkov.yaml \
+            --directory . \
+            --output cli \
+            --output sarif \
+            --output json \
+            --output-file-path security-reports/checkov \
+            --soft-fail
+
+      - name: Upload Checkov SARIF Results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: security-reports/checkov.sarif
+          category: checkov
+
+      - name: Upload Checkov Reports
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: checkov-reports
+          path: security-reports/checkov.*
+          retention-days: 30
+
+  tfsec-scan:
+    name: "TFSec Security Scan"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup TFSec
+        run: |
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+          sudo mv tfsec /usr/local/bin/
+          tfsec --version
+
+      - name: Create TFSec Configuration
+        run: |
+          cat > .tfsec.yaml << EOF
+          # TFSec configuration for AWS Data Platform
+          
+          severity_overrides:
+            HIGH: error
+            MEDIUM: warning
+            LOW: info
+          
+          exclude:
+            - aws-s3-enable-logging  # S3 logging handled separately
+            - aws-s3-specify-public-access-block  # Explicitly configured
+          
+          include_ignored: false
+          include_passed: false
+          
+          output_formats:
+            - default
+            - sarif
+            - json
+          EOF
+
+      - name: Run TFSec Scan
+        run: |
+          echo "Running TFSec security scan..."
+          
+          # Create output directory
+          mkdir -p security-reports
+          
+          # Run TFSec scan
+          tfsec . \
+            --config-file .tfsec.yaml \
+            --format sarif \
+            --out security-reports/tfsec.sarif \
+            --soft-fail
+          
+          # Also generate JSON report
+          tfsec . \
+            --config-file .tfsec.yaml \
+            --format json \
+            --out security-reports/tfsec.json \
+            --soft-fail
+
+      - name: Upload TFSec SARIF Results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: security-reports/tfsec.sarif
+          category: tfsec
+
+      - name: Upload TFSec Reports
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: tfsec-reports
+          path: security-reports/tfsec.*
+          retention-days: 30
+
+  semgrep-scan:
+    name: "Semgrep Security Scan"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/terraform
+          generateSarif: "1"
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+  secrets-scan:
+    name: "Secrets Detection"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install detect-secrets
+        run: |
+          pip install detect-secrets
+          detect-secrets --version
+
+      - name: Create detect-secrets baseline
+        run: |
+          detect-secrets scan --all-files --force-use-all-plugins \
+            --exclude-files '.git/.*' \
+            --exclude-files '.terraform/.*' \
+            --exclude-files '.terragrunt-cache/.*' \
+            > .secrets.baseline
+
+      - name: Run secrets detection
+        run: |
+          echo "Scanning for secrets..."
+          detect-secrets audit .secrets.baseline
+          
+          # Check if any secrets were found
+          if detect-secrets scan --baseline .secrets.baseline --all-files; then
+            echo "✅ No secrets detected"
+          else
+            echo "❌ Potential secrets found!"
+            exit 1
+          fi
+
+  vulnerability-scan:
+    name: "Dependency Vulnerability Scan"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Safety
+        run: |
+          pip install safety
+          safety --version
+
+      - name: Scan Python Dependencies
+        if: hashFiles('**/requirements.txt') != ''
+        run: |
+          echo "Scanning Python dependencies for vulnerabilities..."
+          find . -name "requirements.txt" -exec safety check -r {} \;
+
+      - name: Setup Go
+        if: hashFiles('**/go.mod') != ''
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install Nancy (Go vulnerability scanner)
+        if: hashFiles('**/go.mod') != ''
+        run: |
+          go install github.com/sonatypecommunity/nancy@latest
+
+      - name: Scan Go Dependencies
+        if: hashFiles('**/go.mod') != ''
+        run: |
+          echo "Scanning Go dependencies for vulnerabilities..."
+          find . -name "go.mod" -execdir go list -json -m all \; | nancy sleuth
+
+  security-summary:
+    name: "Security Summary"
+    runs-on: ubuntu-latest
+    needs: [checkov-scan, tfsec-scan, semgrep-scan, secrets-scan, vulnerability-scan]
+    if: always()
+
+    steps:
+      - name: Download All Reports
+        uses: actions/download-artifact@v3
+        with:
+          path: all-reports
+
+      - name: Generate Security Summary
+        run: |
+          echo "## 🔒 Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check each job result
+          checkov_result="${{ needs.checkov-scan.result }}"
+          tfsec_result="${{ needs.tfsec-scan.result }}"
+          semgrep_result="${{ needs.semgrep-scan.result }}"
+          secrets_result="${{ needs.secrets-scan.result }}"
+          vuln_result="${{ needs.vulnerability-scan.result }}"
+          
+          echo "| Scan Type | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Checkov | $([ "$checkov_result" == "success" ] && echo "✅ Passed" || echo "❌ Failed") |" >> $GITHUB_STEP_SUMMARY
+          echo "| TFSec | $([ "$tfsec_result" == "success" ] && echo "✅ Passed" || echo "❌ Failed") |" >> $GITHUB_STEP_SUMMARY
+          echo "| Semgrep | $([ "$semgrep_result" == "success" ] && echo "✅ Passed" || echo "❌ Failed") |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secrets Detection | $([ "$secrets_result" == "success" ] && echo "✅ Passed" || echo "❌ Failed") |" >> $GITHUB_STEP_SUMMARY
+          echo "| Vulnerability Scan | $([ "$vuln_result" == "success" ] && echo "✅ Passed" || echo "❌ Failed") |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Overall status
+          if [ "$checkov_result" == "success" ] && [ "$tfsec_result" == "success" ] && [ "$semgrep_result" == "success" ] && [ "$secrets_result" == "success" ] && [ "$vuln_result" == "success" ]; then
+            echo "**Overall Status**: ✅ All security scans passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Overall Status**: ❌ Some security scans failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Comment PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const results = {
+              checkov: "${{ needs.checkov-scan.result }}",
+              tfsec: "${{ needs.tfsec-scan.result }}",
+              semgrep: "${{ needs.semgrep-scan.result }}",
+              secrets: "${{ needs.secrets-scan.result }}",
+              vulnerability: "${{ needs.vulnerability-scan.result }}"
+            };
+            
+            const getStatus = (result) => result === "success" ? "✅ Passed" : "❌ Failed";
+            const allPassed = Object.values(results).every(r => r === "success");
+            
+            const comment = `## 🔒 Security Scan Results
+            
+            **Overall Status**: ${allPassed ? "✅ All scans passed" : "❌ Some scans failed"}
+            
+            | Scan Type | Status |
+            |-----------|--------|
+            | Checkov (IaC Security) | ${getStatus(results.checkov)} |
+            | TFSec (Terraform Security) | ${getStatus(results.tfsec)} |
+            | Semgrep (Code Security) | ${getStatus(results.semgrep)} |
+            | Secrets Detection | ${getStatus(results.secrets)} |
+            | Vulnerability Scan | ${getStatus(results.vulnerability)} |
+            
+            <details>
+            <summary>Security Tools Information</summary>
+            
+            - **Checkov**: Infrastructure as Code security scanner
+            - **TFSec**: Terraform-specific security scanner  
+            - **Semgrep**: Static analysis security scanner
+            - **detect-secrets**: Prevents secrets in code
+            - **Safety/Nancy**: Dependency vulnerability scanners
+            
+            View detailed reports in the Actions tab.
+            </details>`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            }); 

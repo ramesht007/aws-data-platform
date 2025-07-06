@@ -1,0 +1,105 @@
+# =============================================================================
+# Development Environment Configuration
+# Cost-optimized settings for development workloads
+# =============================================================================
+
+# Networking overrides for dev
+networking:
+  vpc:
+    cidr: "10.0.0.0/16"
+  
+  # Smaller subnets for dev
+  subnets:
+    private:
+      - "10.0.1.0/24"
+      - "10.0.2.0/24"
+      - "10.0.3.0/24"
+    public:
+      - "10.0.101.0/24"
+      - "10.0.102.0/24"
+      - "10.0.103.0/24"
+    database:
+      - "10.0.201.0/24"
+      - "10.0.202.0/24"
+      - "10.0.203.0/24"
+  
+  # Single NAT Gateway for cost savings in dev
+  nat_gateway:
+    single_nat_gateway: true
+
+# Storage overrides for dev
+storage:
+  s3:
+    force_destroy: true  # Allow destruction in dev
+  
+  # Shorter lifecycle for dev
+  lifecycle:
+    transition_ia_days: 7
+    transition_glacier_days: 30
+    expiration_days: 365  # 1 year
+
+# Streaming overrides for dev
+streaming:
+  kinesis:
+    shard_count: 1
+    retention_period: 24
+  
+  msk:
+    kafka_version: "2.8.1"
+    number_of_broker_nodes: 1  # Single node for dev
+    instance_type: "kafka.t3.small"
+
+# Orchestration overrides for dev
+orchestration:
+  mwaa:
+    airflow_version: "2.5.1"
+    environment_class: "mw1.small"
+    max_workers: 2
+    min_workers: 1
+    schedulers: 1
+  
+  step_functions:
+    enable_logging: false  # Reduce costs in dev
+
+# Analytics overrides for dev
+analytics:
+  athena:
+    query_result_retention_days: 7  # Shorter retention
+  
+  # Smaller Redshift for dev workloads
+  redshift:
+    node_type: "dc2.large"
+    number_of_nodes: 1
+
+# Monitoring overrides for dev
+monitoring:
+  cloudwatch:
+    retention_days: 7  # Shorter retention for cost savings
+    enable_detailed_monitoring: false
+  
+  cloudtrail:
+    retention_days: 30
+
+# Security overrides for dev
+security:
+  kms:
+    deletion_window: 7  # Faster deletion in dev
+
+# Development-specific features
+development:
+  enable_debug_logging: true
+  allow_public_access: false  # Still maintain security
+  enable_cost_alerts: true
+  
+  # Cost optimization
+  auto_scaling:
+    enable: true
+    scale_down_after_hours: true
+    weekend_shutdown: true
+
+# Environment-specific tags
+tags:
+  Environment: "development"
+  CostOptimization: "enabled"
+  DataClassification: "internal"
+  Monitoring: "basic" 

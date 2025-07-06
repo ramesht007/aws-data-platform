@@ -1,0 +1,230 @@
+# =============================================================================
+# Terraform Validation Workflow
+# Validates Terraform code on pull requests
+# =============================================================================
+
+name: "Terraform Validation"
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "**.tf"
+      - "**.hcl"
+      - "**.yaml"
+      - "**.yml"
+      - ".github/workflows/terraform-validation.yml"
+
+concurrency:
+  group: terraform-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: "1.5.7"
+  TERRAGRUNT_VERSION: "0.53.0"
+  TF_LOG: INFO
+  AWS_REGION: us-east-1
+
+jobs:
+  validation:
+    name: "Terraform Validation"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          curl -sLo terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TERRAGRUNT_VERSION }}/terragrunt_linux_amd64
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/
+
+      - name: Cache Terraform Providers
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.terraform.d/plugin-cache
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: terraform-validation
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate Root Terragrunt Configuration
+        run: |
+          echo "Validating root.hcl configuration..."
+          terragrunt hclfmt --terragrunt-check --terragrunt-diff
+
+      - name: Check Terraform Formatting
+        run: |
+          echo "Checking Terraform formatting..."
+          terraform fmt -check -recursive -diff
+
+      - name: Validate Terraform Modules
+        run: |
+          echo "Validating individual Terraform modules..."
+          for module_dir in modules/*/; do
+            if [ -d "$module_dir" ]; then
+              echo "Validating module: $module_dir"
+              cd "$module_dir"
+              terraform init -backend=false
+              terraform validate
+              cd - > /dev/null
+            fi
+          done
+
+      - name: Validate Terragrunt Environments
+        run: |
+          echo "Validating Terragrunt environments..."
+          
+          # Create temporary backend configuration for validation
+          mkdir -p /tmp/terraform-backend
+          cat > /tmp/terraform-backend/backend.tf << EOF
+          terraform {
+            backend "local" {}
+          }
+          EOF
+          
+          # Validate each environment
+          for env in dev staging prod; do
+            for region in us-east-1 us-west-2; do
+              echo "Validating environment: $env/$region"
+              
+              # Find all module directories in this environment/region
+              if [ -d "environments/$env/$region" ]; then
+                for module_path in environments/$env/$region/*/; do
+                  if [ -f "$module_path/terragrunt.hcl" ]; then
+                    echo "Validating: $module_path"
+                    cd "$module_path"
+                    
+                    # Run terragrunt validate-inputs (dry run)
+                    terragrunt validate-inputs --terragrunt-non-interactive || {
+                      echo "Validation failed for $module_path"
+                      exit 1
+                    }
+                    
+                    cd - > /dev/null
+                  fi
+                done
+              fi
+            done
+          done
+
+      - name: Check for Security Issues
+        run: |
+          echo "Running basic security checks..."
+          
+          # Check for hardcoded secrets
+          if grep -r -i "password\|secret\|key" --include="*.tf" --include="*.hcl" --include="*.yaml" . | grep -v "variable\|description\|example"; then
+            echo "WARNING: Potential hardcoded secrets found!"
+            exit 1
+          fi
+          
+          # Check for public S3 buckets
+          if grep -r "acl.*public" --include="*.tf" .; then
+            echo "WARNING: Public S3 bucket ACL found!"
+            exit 1
+          fi
+
+      - name: Generate Plan Summary
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "## Terraform Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "✅ All Terraform configurations are valid" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Formatting is correct" >> $GITHUB_STEP_SUMMARY
+          echo "✅ All modules validated successfully" >> $GITHUB_STEP_SUMMARY
+          echo "✅ No security issues detected" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = `## 🔍 Terraform Validation Results
+            
+            ✅ **Validation Status**: PASSED
+            ✅ **Formatting**: Correct
+            ✅ **Module Validation**: All modules valid
+            ✅ **Security Check**: No issues found
+            
+            All Terraform configurations have been validated successfully!
+            
+            <details>
+            <summary>Validation Details</summary>
+            
+            - Terraform version: ${{ env.TERRAFORM_VERSION }}
+            - Terragrunt version: ${{ env.TERRAGRUNT_VERSION }}
+            - Modules validated: ${process.env.GITHUB_WORKSPACE}/modules/*
+            - Environments validated: dev, staging, prod
+            - Regions validated: us-east-1, us-west-2
+            
+            </details>`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  documentation:
+    name: "Documentation Check"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Check README Files
+        run: |
+          echo "Checking for README files in modules..."
+          missing_readmes=()
+          
+          for module_dir in modules/*/; do
+            if [ -d "$module_dir" ] && [ ! -f "$module_dir/README.md" ]; then
+              missing_readmes+=("$module_dir")
+            fi
+          done
+          
+          if [ ${#missing_readmes[@]} -gt 0 ]; then
+            echo "Missing README.md files in:"
+            printf '%s\n' "${missing_readmes[@]}"
+            exit 1
+          fi
+          
+          echo "✅ All modules have README files"
+
+      - name: Validate YAML Files
+        run: |
+          echo "Validating YAML configuration files..."
+          
+          # Install yq for YAML validation
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          
+          # Validate all YAML files
+          find config/ -name "*.yaml" -o -name "*.yml" | while read -r file; do
+            echo "Validating: $file"
+            yq eval '.' "$file" > /dev/null || {
+              echo "YAML validation failed for: $file"
+              exit 1
+            }
+          done
+          
+          echo "✅ All YAML files are valid" 

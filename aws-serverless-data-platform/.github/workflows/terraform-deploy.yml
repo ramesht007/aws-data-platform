@@ -1,0 +1,348 @@
+# =============================================================================
+# Terraform Deployment Workflow
+# Plans and applies Terraform infrastructure changes
+# =============================================================================
+
+name: "Terraform Deploy"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.tf"
+      - "**.hcl"
+      - "**.yaml"
+      - "**.yml"
+  
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      action:
+        description: "Action to perform"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      region:
+        description: "AWS Region"
+        required: true
+        default: "us-east-1"
+        type: choice
+        options:
+          - us-east-1
+          - us-west-2
+
+concurrency:
+  group: terraform-deploy-${{ github.event.inputs.environment || 'auto' }}
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: "1.5.7"
+  TERRAGRUNT_VERSION: "0.53.0"
+  TF_LOG: INFO
+  AWS_REGION: ${{ github.event.inputs.region || 'us-east-1' }}
+
+jobs:
+  determine-deployment:
+    name: "Determine Deployment Strategy"
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.strategy.outputs.environments }}
+      action: ${{ steps.strategy.outputs.action }}
+    
+    steps:
+      - name: Determine Strategy
+        id: strategy
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # Manual deployment - single environment
+            environments='["${{ github.event.inputs.environment }}"]'
+            action="${{ github.event.inputs.action }}"
+          else
+            # Automatic deployment on main branch - dev only
+            environments='["dev"]'
+            action="apply"
+          fi
+          
+          echo "environments=$environments" >> $GITHUB_OUTPUT
+          echo "action=$action" >> $GITHUB_OUTPUT
+          
+          echo "Deployment strategy:"
+          echo "  Environments: $environments"
+          echo "  Action: $action"
+
+  plan:
+    name: "Plan - ${{ matrix.environment }}"
+    runs-on: ubuntu-latest
+    needs: determine-deployment
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.determine-deployment.outputs.environments) }}
+    
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          curl -sLo terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TERRAGRUNT_VERSION }}/terragrunt_linux_amd64
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: terraform-plan-${{ matrix.environment }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Cache Terraform Providers
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.terraform.d/plugin-cache
+            */.terraform
+          key: ${{ runner.os }}-terraform-${{ matrix.environment }}-${{ env.AWS_REGION }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+
+      - name: Initialize Terragrunt
+        working-directory: environments/${{ matrix.environment }}/${{ env.AWS_REGION }}
+        run: |
+          echo "Initializing Terragrunt for environment: ${{ matrix.environment }}"
+          terragrunt run-all init --terragrunt-non-interactive
+
+      - name: Generate Terraform Plan
+        working-directory: environments/${{ matrix.environment }}/${{ env.AWS_REGION }}
+        run: |
+          echo "Generating Terraform plan for environment: ${{ matrix.environment }}"
+          
+          # Create plan directory
+          mkdir -p ../../../plans/${{ matrix.environment }}/${{ env.AWS_REGION }}
+          
+          # Generate plan for all modules
+          terragrunt run-all plan \
+            --terragrunt-non-interactive \
+            --terragrunt-out-dir ../../../plans/${{ matrix.environment }}/${{ env.AWS_REGION }} \
+            --terragrunt-log-level info
+
+      - name: Generate Plan Summary
+        working-directory: environments/${{ matrix.environment }}/${{ env.AWS_REGION }}
+        run: |
+          echo "## 📋 Terraform Plan Summary - ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment**: ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Region**: ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Action**: ${{ needs.determine-deployment.outputs.action }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Count changes from plan files
+          total_changes=0
+          for plan_file in ../../../plans/${{ matrix.environment }}/${{ env.AWS_REGION }}/*/*plan; do
+            if [ -f "$plan_file" ]; then
+              changes=$(terraform show -json "$plan_file" | jq '.resource_changes | length' 2>/dev/null || echo "0")
+              total_changes=$((total_changes + changes))
+            fi
+          done
+          
+          echo "**Total Changes**: $total_changes resources" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Plan Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan-${{ matrix.environment }}-${{ env.AWS_REGION }}
+          path: plans/${{ matrix.environment }}/${{ env.AWS_REGION }}
+          retention-days: 30
+
+  apply:
+    name: "Apply - ${{ matrix.environment }}"
+    runs-on: ubuntu-latest
+    needs: [determine-deployment, plan]
+    if: ${{ needs.determine-deployment.outputs.action == 'apply' }}
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.determine-deployment.outputs.environments) }}
+    
+    environment:
+      name: ${{ matrix.environment }}
+      url: https://console.aws.amazon.com/
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          curl -sLo terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TERRAGRUNT_VERSION }}/terragrunt_linux_amd64
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: terraform-apply-${{ matrix.environment }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download Plan Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan-${{ matrix.environment }}-${{ env.AWS_REGION }}
+          path: plans/${{ matrix.environment }}/${{ env.AWS_REGION }}
+
+      - name: Apply Terraform Changes
+        working-directory: environments/${{ matrix.environment }}/${{ env.AWS_REGION }}
+        run: |
+          echo "Applying Terraform changes for environment: ${{ matrix.environment }}"
+          
+          # Apply in dependency order
+          modules_order=(
+            "01-networking"
+            "02-security"
+            "03-storage"
+            "04-data-catalog"
+            "05-streaming"
+            "06-orchestration"
+            "07-analytics"
+            "08-monitoring"
+          )
+          
+          for module in "${modules_order[@]}"; do
+            if [ -d "$module" ]; then
+              echo "Applying module: $module"
+              cd "$module"
+              
+              # Initialize if not already done
+              terragrunt init --terragrunt-non-interactive
+              
+              # Apply the module
+              terragrunt apply --terragrunt-non-interactive --auto-approve
+              
+              cd ..
+            fi
+          done
+
+      - name: Generate Apply Summary
+        run: |
+          echo "## ✅ Terraform Apply Completed - ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment**: ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Region**: ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: Successfully applied" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+
+  destroy:
+    name: "Destroy - ${{ matrix.environment }}"
+    runs-on: ubuntu-latest
+    needs: [determine-deployment, plan]
+    if: ${{ needs.determine-deployment.outputs.action == 'destroy' }}
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.determine-deployment.outputs.environments) }}
+    
+    environment:
+      name: destroy-${{ matrix.environment }}
+      url: https://console.aws.amazon.com/
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          curl -sLo terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TERRAGRUNT_VERSION }}/terragrunt_linux_amd64
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: terraform-destroy-${{ matrix.environment }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Confirm Destroy Action
+        run: |
+          echo "⚠️ DESTRUCTION REQUESTED for environment: ${{ matrix.environment }}"
+          echo "This will destroy ALL infrastructure in the environment!"
+          
+          # Add additional safety check for production
+          if [ "${{ matrix.environment }}" == "prod" ]; then
+            echo "🚨 PRODUCTION DESTRUCTION BLOCKED"
+            echo "Production environment destruction requires manual approval"
+            exit 1
+          fi
+
+      - name: Destroy Infrastructure
+        working-directory: environments/${{ matrix.environment }}/${{ env.AWS_REGION }}
+        run: |
+          echo "Destroying infrastructure for environment: ${{ matrix.environment }}"
+          
+          # Destroy in reverse dependency order
+          modules_order=(
+            "08-monitoring"
+            "07-analytics"
+            "06-orchestration"
+            "05-streaming"
+            "04-data-catalog"
+            "03-storage"
+            "02-security"
+            "01-networking"
+          )
+          
+          for module in "${modules_order[@]}"; do
+            if [ -d "$module" ]; then
+              echo "Destroying module: $module"
+              cd "$module"
+              
+              # Initialize and destroy
+              terragrunt init --terragrunt-non-interactive
+              terragrunt destroy --terragrunt-non-interactive --auto-approve
+              
+              cd ..
+            fi
+          done 

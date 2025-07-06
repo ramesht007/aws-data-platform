@@ -1,0 +1,285 @@
+# =============================================================================
+# Terratest Workflow
+# Runs Go tests for infrastructure validation
+# =============================================================================
+
+name: "Terratest"
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "modules/**"
+      - "tests/**"
+      - ".github/workflows/terratest.yml"
+
+concurrency:
+  group: terratest-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: "1.5.7"
+  TERRAGRUNT_VERSION: "0.53.0"
+  GO_VERSION: "1.21"
+  AWS_REGION: us-east-1
+
+jobs:
+  determine-tests:
+    name: "Determine Tests to Run"
+    runs-on: ubuntu-latest
+    outputs:
+      module-tests: ${{ steps.find-tests.outputs.module-tests }}
+      integration-tests: ${{ steps.find-tests.outputs.integration-tests }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find Changed Modules
+        id: find-tests
+        run: |
+          # Get list of changed files
+          changed_files=$(git diff --name-only origin/main...HEAD)
+          
+          # Find affected modules
+          affected_modules=()
+          for file in $changed_files; do
+            if [[ $file =~ ^modules/([^/]+)/ ]]; then
+              module_name="${BASH_REMATCH[1]}"
+              if [[ ! " ${affected_modules[@]} " =~ " ${module_name} " ]]; then
+                affected_modules+=("$module_name")
+              fi
+            fi
+          done
+          
+          # Check if integration tests should run
+          run_integration=false
+          if [[ $changed_files =~ (environments/|tests/integration/|root\.hcl) ]]; then
+            run_integration=true
+          fi
+          
+          # Output arrays as JSON
+          module_tests_json=$(printf '%s\n' "${affected_modules[@]}" | jq -R . | jq -s .)
+          echo "module-tests=$module_tests_json" >> $GITHUB_OUTPUT
+          echo "integration-tests=$run_integration" >> $GITHUB_OUTPUT
+          
+          echo "Affected modules: ${affected_modules[*]}"
+          echo "Run integration tests: $run_integration"
+
+  module-tests:
+    name: "Module Tests"
+    runs-on: ubuntu-latest
+    needs: determine-tests
+    if: ${{ needs.determine-tests.outputs.module-tests != '[]' }}
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.determine-tests.outputs.module-tests) }}
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Cache Go Modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TEST_ROLE_ARN }}
+          role-session-name: terratest-${{ matrix.module }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download Go Dependencies
+        working-directory: tests
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Run Module Tests
+        working-directory: tests
+        env:
+          MODULE_NAME: ${{ matrix.module }}
+        run: |
+          echo "Running tests for module: $MODULE_NAME"
+          
+          # Set test timeout (30 minutes)
+          timeout="30m"
+          
+          # Run the specific module test
+          if [ -f "../modules/$MODULE_NAME/tests/${MODULE_NAME}_test.go" ]; then
+            go test -v -timeout $timeout -run "Test$(echo $MODULE_NAME | sed 's/^./\U&/; s/-\(.\)/\U\1/g')" ../modules/$MODULE_NAME/tests/
+          else
+            echo "No tests found for module: $MODULE_NAME"
+          fi
+
+      - name: Generate Test Report
+        if: always()
+        run: |
+          echo "## Test Results for ${{ matrix.module }}" >> $GITHUB_STEP_SUMMARY
+          if [ $? -eq 0 ]; then
+            echo "✅ Tests passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Tests failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  integration-tests:
+    name: "Integration Tests"
+    runs-on: ubuntu-latest
+    needs: determine-tests
+    if: ${{ needs.determine-tests.outputs.integration-tests == 'true' }}
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev]  # Start with dev only, add staging/prod as needed
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          curl -sLo terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TERRAGRUNT_VERSION }}/terragrunt_linux_amd64
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TEST_ROLE_ARN }}
+          role-session-name: integration-test-${{ matrix.environment }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run Integration Tests
+        working-directory: tests
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          echo "Running integration tests for environment: $ENVIRONMENT"
+          
+          # Set longer timeout for integration tests (60 minutes)
+          timeout="60m"
+          
+          # Run integration tests
+          go test -v -timeout $timeout -run "TestIntegration" ./integration/
+
+      - name: Cleanup Resources
+        if: always()
+        working-directory: tests
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          echo "Cleaning up test resources..."
+          # Run cleanup script if it exists
+          if [ -f "./cleanup.go" ]; then
+            go run ./cleanup.go -environment=$ENVIRONMENT
+          fi
+
+  test-summary:
+    name: "Test Summary"
+    runs-on: ubuntu-latest
+    needs: [module-tests, integration-tests]
+    if: always()
+    
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## 🧪 Terratest Results Summary" >> $GITHUB_STEP_SUMMARY
+          
+          # Module tests summary
+          if [ "${{ needs.module-tests.result }}" == "success" ]; then
+            echo "✅ **Module Tests**: All passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.module-tests.result }}" == "failure" ]; then
+            echo "❌ **Module Tests**: Some failed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.module-tests.result }}" == "skipped" ]; then
+            echo "⏭️ **Module Tests**: Skipped (no module changes)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Integration tests summary
+          if [ "${{ needs.integration-tests.result }}" == "success" ]; then
+            echo "✅ **Integration Tests**: All passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.integration-tests.result }}" == "failure" ]; then
+            echo "❌ **Integration Tests**: Some failed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.integration-tests.result }}" == "skipped" ]; then
+            echo "⏭️ **Integration Tests**: Skipped (no integration changes)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Comment PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const moduleResult = "${{ needs.module-tests.result }}";
+            const integrationResult = "${{ needs.integration-tests.result }}";
+            
+            let status = "✅ PASSED";
+            if (moduleResult === "failure" || integrationResult === "failure") {
+              status = "❌ FAILED";
+            }
+            
+            const comment = `## 🧪 Terratest Results
+            
+            **Overall Status**: ${status}
+            
+            ### Test Results
+            - **Module Tests**: ${moduleResult === "success" ? "✅ Passed" : moduleResult === "failure" ? "❌ Failed" : "⏭️ Skipped"}
+            - **Integration Tests**: ${integrationResult === "success" ? "✅ Passed" : integrationResult === "failure" ? "❌ Failed" : "⏭️ Skipped"}
+            
+            <details>
+            <summary>Test Configuration</summary>
+            
+            - Go version: ${{ env.GO_VERSION }}
+            - Terraform version: ${{ env.TERRAFORM_VERSION }}
+            - Test environment: dev
+            - Test timeout: 30m (module), 60m (integration)
+            
+            </details>`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            }); 

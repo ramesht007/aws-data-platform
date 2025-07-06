@@ -1,0 +1,125 @@
+# =============================================================================
+# Common Configuration
+# Shared settings across all environments and regions
+# =============================================================================
+
+project:
+  name: "aws-serverless-data-platform"
+  description: "Production-grade serverless data lake platform on AWS"
+  repository: "https://github.com/mindbuttergold/aws-data-platform"
+  owner: "Data Platform Team"
+  cost_center: "DataEngineering"
+
+# Terraform and provider versions
+terraform:
+  version: ">= 1.5"
+  aws_provider_version: "~> 5.0"
+  state_region: "ap-southeast-1"  # Centralized state management region
+
+# Default networking configuration
+networking:
+  vpc:
+    enable_dns_hostnames: true
+    enable_dns_support: true
+  
+  # Default subnets per AZ
+  availability_zones: 3
+  
+  # NAT Gateway configuration
+  nat_gateway:
+    enable: true
+    single_nat_gateway: false  # One per AZ for HA
+  
+  # VPC Flow Logs
+  flow_logs:
+    enable: true
+    retention_days: 30
+
+# Storage defaults
+storage:
+  s3:
+    versioning: true
+    encryption: "AES256"
+    public_access_block: true
+    force_destroy: false
+  
+  # Default lifecycle policies
+  lifecycle:
+    transition_ia_days: 30
+    transition_glacier_days: 90
+    transition_deep_archive_days: 365
+    expiration_days: 2555  # 7 years
+
+# Data catalog defaults
+data_catalog:
+  glue:
+    enable_crawler: true
+    crawler_schedule: "cron(0 6 * * ? *)"  # Daily at 6 AM UTC
+  
+# Streaming defaults
+streaming:
+  kinesis:
+    shard_count: 1
+    retention_period: 24  # hours
+  
+  msk:
+    kafka_version: "2.8.1"
+    number_of_broker_nodes: 3
+    instance_type: "kafka.m5.large"
+
+# Orchestration defaults
+orchestration:
+  mwaa:
+    airflow_version: "2.5.1"
+    max_workers: 10
+    min_workers: 1
+    schedulers: 2
+  
+  step_functions:
+    enable_logging: true
+    log_level: "ALL"
+
+# Analytics defaults
+analytics:
+  athena:
+    enable_query_result_encryption: true
+    query_result_retention_days: 30
+  
+  quicksight:
+    enable: false  # Can be overridden per environment
+
+# Monitoring and logging
+monitoring:
+  cloudwatch:
+    retention_days: 30
+    enable_detailed_monitoring: true
+  
+  cloudtrail:
+    enable: true
+    enable_logging: true
+    include_global_service_events: true
+    is_multi_region_trail: true
+    retention_days: 90
+
+# Security defaults
+security:
+  kms:
+    deletion_window: 30
+    enable_key_rotation: true
+  
+  iam:
+    password_policy:
+      minimum_password_length: 14
+      require_lowercase_characters: true
+      require_uppercase_characters: true
+      require_numbers: true
+      require_symbols: true
+      max_password_age: 90
+
+# Default tags applied to all resources
+tags:
+  ManagedBy: "Terraform"
+  Project: "aws-serverless-data-platform"
+  Team: "DataEngineering"
+  Backup: "Required"
+  SecurityLevel: "Standard" 

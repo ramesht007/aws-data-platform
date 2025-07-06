@@ -4,3 +4,9 @@
 
 # Mac
 .DS_Store
+
+# terraform
+.terraform/
+.terragrunt-cache/
+*.tfstate
+*.tfstate.backup
