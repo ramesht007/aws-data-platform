@@ -79,36 +79,6 @@ resource "aws_kms_alias" "secrets_key" {
 # IAM Roles for Data Platform Services
 # =============================================================================
 
-# Lambda execution role
-resource "aws_iam_role" "lambda_role" {
-  name = "${var.project_name}-lambda-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-      }
-    ]
-  })
-
-  tags = var.common_tags
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_basic" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_vpc" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
-}
-
 # Glue service role
 resource "aws_iam_role" "glue_role" {
   name = "${var.project_name}-glue-role"
@@ -146,26 +116,6 @@ resource "aws_iam_role" "kinesis_analytics_role" {
         Effect = "Allow"
         Principal = {
           Service = "kinesisanalytics.amazonaws.com"
-        }
-      }
-    ]
-  })
-
-  tags = var.common_tags
-}
-
-# Step Functions role
-resource "aws_iam_role" "step_functions_role" {
-  name = "${var.project_name}-step-functions-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "states.amazonaws.com"
         }
       }
     ]
@@ -272,32 +222,6 @@ resource "aws_iam_policy" "kinesis_access" {
 # Security Groups
 # =============================================================================
 
-# Lambda security group
-resource "aws_security_group" "lambda_sg" {
-  name_prefix = "${var.project_name}-lambda-"
-  vpc_id      = var.vpc_id
-
-  egress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "HTTPS outbound for AWS API calls"
-  }
-
-  egress {
-    from_port   = 53
-    to_port     = 53
-    protocol    = "udp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "DNS resolution"
-  }
-
-  tags = merge(var.common_tags, {
-    Name = "${var.project_name}-lambda-sg"
-  })
-}
-
 # Data processing security group
 resource "aws_security_group" "data_processing_sg" {
   name_prefix = "${var.project_name}-data-processing-"
@@ -327,21 +251,6 @@ resource "aws_security_group" "data_processing_sg" {
 # =============================================================================
 # IAM Role Policy Attachments
 # =============================================================================
-
-resource "aws_iam_role_policy_attachment" "lambda_s3_access" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = aws_iam_policy.s3_data_access.arn
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_glue_access" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = aws_iam_policy.glue_catalog_access.arn
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_kinesis_access" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = aws_iam_policy.kinesis_access.arn
-}
 
 resource "aws_iam_role_policy_attachment" "glue_s3_access" {
   role       = aws_iam_role.glue_role.name
